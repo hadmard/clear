@@ -1,0 +1,28 @@
+dataset_dir: /path/to/dataset_uv
+white_dir: /path/to/dataset_white
+# The training scripts create timestamped defaults such as
+# output/ref_uv_small_2x4090/YYYYMMDD_HHMMSS. Set this only when you want to
+# override that default.
+output_dir: output/ref_uv_small_manual
+variant: small
+teacher_checkpoint: output/uv_teacher_2x4090/<timestamp>/checkpoint_best_total.pth
+epochs: 120
+batch_size: 4
+grad_accum_steps: 2
+lr: 0.0001
+lr_encoder: 0.00015
+warmup_epochs: 1.0
+lr_scheduler: cosine
+lr_min_factor: 0.05
+checkpoint_interval: 5
+skip_best_epochs: 5
+early_stopping: true
+early_stopping_patience: 20
+early_stopping_min_delta: 0.001
+early_stopping_use_ema: true
+lambda_teacher_cls: 0.2
+lambda_teacher_box: 0.5
+lambda_prior: 0.05
+lambda_gate: 0.001
+max_cls_beta: 0.1
+max_box_beta: 0.3
