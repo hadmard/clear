@@ -29,8 +29,8 @@ REFERENCE_PRIOR_NAMES: Final[tuple[str, ...]] = (
     "log_bg_residual",
     "exb_residual",
     "white_edge",
-    "white_leaf_mask",
-    "white_distance_to_boundary",
+    "reserved_leaf_confidence",
+    "reserved_distance_to_boundary",
 )
 REFERENCE_PRIOR_CHANNELS: Final[int] = len(REFERENCE_PRIOR_NAMES)
 
@@ -59,9 +59,10 @@ def _as_float_rgb(image: np.ndarray) -> np.ndarray:
 def _robust_leaf_mask(white_rgb: np.ndarray) -> np.ndarray:
     """Estimate a leaf support mask from the white-light image.
 
-    The mask is intentionally conservative: it removes black borders and very
-    flat background while keeping low-saturation leaf pixels.  If the heuristic
-    becomes too sparse, it falls back to all non-dark pixels so prior generation
+    The mask is intentionally conservative about background: it starts from
+    green/saturated foreground pixels, keeps the dominant connected leaf
+    components, and then closes small holes.  If the heuristic becomes too
+    sparse, it falls back to a broader non-dark foreground so prior generation
     never fails mid-training.
 
     Args:
@@ -74,18 +75,42 @@ def _robust_leaf_mask(white_rgb: np.ndarray) -> np.ndarray:
     max_c = white_rgb.max(axis=-1)
     min_c = white_rgb.min(axis=-1)
     saturation = max_c - min_c
-    green_support = white_rgb[..., 1] >= (0.75 * white_rgb[..., 0])
+    red = white_rgb[..., 0]
+    green = white_rgb[..., 1]
+    blue = white_rgb[..., 2]
 
-    dark_cutoff = max(0.03, float(np.percentile(gray, 3)))
-    mask = (gray > dark_cutoff) & ((saturation > 0.035) | green_support)
-    if float(mask.mean()) < 0.05:
-        mask = gray > dark_cutoff
-    if float(mask.mean()) < 0.05:
+    dark_cutoff = max(0.035, float(np.percentile(gray, 5)))
+    non_dark = gray > dark_cutoff
+    green_dominant = (green > red * 0.82) & (green > blue * 0.82)
+    green_excess = (2.0 * green - red - blue) > 0.035
+    colorful_leaf = saturation > 0.055
+    mask = non_dark & ((green_dominant & colorful_leaf) | green_excess)
+
+    # Keep large connected regions instead of grid lines, labels, and small
+    # reflections.  Multiple components are allowed because one frame can
+    # contain several separated leaves.
+    labeled, component_count = ndimage.label(mask)
+    if component_count:
+        component_sizes = np.bincount(labeled.ravel())
+        component_sizes[0] = 0
+        min_component_area = max(64, int(mask.size * 0.002))
+        keep_labels = np.flatnonzero(component_sizes >= min_component_area)
+        if keep_labels.size:
+            mask = np.isin(labeled, keep_labels)
+
+    # Grow through darker veins and tiny gaps, then smooth boundaries without
+    # spilling into the low-saturation grid/background.
+    likely_leaf = non_dark & ((saturation > 0.035) | green_dominant)
+    mask = ndimage.binary_dilation(mask, structure=np.ones((5, 5), dtype=bool), iterations=1) & likely_leaf
+    mask = ndimage.binary_closing(mask, structure=np.ones((7, 7), dtype=bool))
+    mask = ndimage.binary_opening(mask, structure=np.ones((3, 3), dtype=bool))
+    mask = ndimage.binary_fill_holes(mask)
+
+    if float(mask.mean()) < 0.03:
+        mask = non_dark & ((saturation > 0.045) | green_dominant)
+    if float(mask.mean()) < 0.03:
         mask = np.ones_like(gray, dtype=bool)
 
-    # Small holes make the leaf-level median noisy near veins and specular spots.
-    mask = ndimage.binary_closing(mask, structure=np.ones((5, 5), dtype=bool))
-    mask = ndimage.binary_fill_holes(mask)
     return mask.astype(bool, copy=False)
 
 
@@ -105,6 +130,23 @@ def _center_over_leaf(values: np.ndarray, leaf_mask: np.ndarray) -> np.ndarray:
     else:
         center = np.median(flat, axis=0).astype(np.float32)
     return values - center.reshape((1, 1, -1))
+
+
+def _leaf_confidence(leaf_mask: np.ndarray) -> np.ndarray:
+    """Return a soft confidence map for where white-derived priors are trusted.
+
+    Args:
+        leaf_mask: Boolean leaf support mask.
+
+    Returns:
+        Float32 ``H x W`` map in ``[0, 1]``.
+    """
+    confidence = leaf_mask.astype(np.float32, copy=False)
+    confidence = ndimage.gaussian_filter(confidence, sigma=2.0)
+    max_value = float(confidence.max())
+    if max_value <= 1e-6:
+        return np.zeros_like(confidence, dtype=np.float32)
+    return np.clip(confidence / max_value, 0.0, 1.0).astype(np.float32, copy=False)
 
 
 def _robust_unit_scale(values: np.ndarray, limit: float = 3.0) -> np.ndarray:
@@ -186,24 +228,34 @@ def build_reference_prior(
         raise ValueError(f"UV and white images must have the same H,W, got {uv.shape} and {white.shape}.")
 
     leaf_mask = _robust_leaf_mask(white)
+    leaf_confidence = _leaf_confidence(leaf_mask)
 
     rnfr = np.log((uv + eps) / (white + eps))
     rnfr = _robust_unit_scale(_center_over_leaf(rnfr, leaf_mask), limit=3.0)
+    rnfr = rnfr * leaf_confidence[..., None]
 
     uv_minus_white = (uv - white).astype(np.float32, copy=False)
+    uv_minus_white = uv_minus_white * leaf_confidence[..., None]
 
     uv_log_bg = np.log((uv[..., 2] + eps) / (uv[..., 1] + eps))
     white_log_bg = np.log((white[..., 2] + eps) / (white[..., 1] + eps))
     log_bg = _center_over_leaf((uv_log_bg - white_log_bg)[..., None], leaf_mask)[..., 0]
     log_bg = _robust_unit_scale(log_bg, limit=3.0)
+    log_bg = log_bg * leaf_confidence
 
     exb_uv = 2.0 * uv[..., 2] - uv[..., 1] - uv[..., 0]
     exb_white = 2.0 * white[..., 2] - white[..., 1] - white[..., 0]
     exb = _center_over_leaf((exb_uv - exb_white)[..., None], leaf_mask)[..., 0]
     exb = _robust_unit_scale(exb, limit=2.0)
+    exb = exb * leaf_confidence
 
-    edge = _white_edge_map(white)
-    distance = _distance_to_leaf_boundary(leaf_mask)
+    edge = _white_edge_map(white) * leaf_confidence
+
+    # The leaf support is useful as an internal denoising weight, but it is not
+    # reliable enough to feed as a strong model input.  Keep the channel layout
+    # stable and leave these reserved channels silent.
+    reserved_leaf = np.zeros_like(leaf_confidence, dtype=np.float32)
+    reserved_distance = np.zeros_like(leaf_confidence, dtype=np.float32)
 
     prior_hwc = np.concatenate(
         [
@@ -212,8 +264,8 @@ def build_reference_prior(
             log_bg[..., None],
             exb[..., None],
             edge[..., None],
-            leaf_mask.astype(np.float32)[..., None],
-            distance[..., None],
+            reserved_leaf[..., None],
+            reserved_distance[..., None],
         ],
         axis=-1,
     )

@@ -64,11 +64,11 @@ TRAINING_DEFAULTS: dict[str, Any] = {
     # rely on validation mAP early stopping to avoid over-training.
     "epochs": 120,
     # Two RTX 4090 cards: this is per-GPU batch size. Effective global batch is
-    # batch_size * grad_accum_steps * devices = 4 * 2 * 2 = 16. This keeps the
-    # global batch aligned with RF-DETR's recommended target while leaving VRAM
-    # room for the reference path and teacher forward pass.
-    "batch_size": 4,
-    "grad_accum_steps": 2,
+    # batch_size * grad_accum_steps * devices = 8 * 1 * 2 = 16. This keeps the
+    # global batch aligned with RF-DETR's recommended target while using more of
+    # the available VRAM and avoiding unnecessary gradient accumulation.
+    "batch_size": 8,
+    "grad_accum_steps": 1,
     # Keep the fine-tuning rate close to RF-DETR's official defaults. Newly
     # added Ref-UV modules use lr; RF-DETR's backbone groups use lr_encoder plus
     # layer/component decay, so the UV representation changes conservatively.

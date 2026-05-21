@@ -35,8 +35,31 @@ from rfdetr.utilities.logger import get_logger
 logger = get_logger()
 
 
+def resolve_coco_train_annotation_file(dataset_dir: str) -> Optional[Path]:
+    """Return the training COCO annotation file for a supported dataset layout.
+
+    Supports both flat Roboflow COCO folders and dual-modal layouts where the
+    UV annotations live under ``train/uv/_annotations.coco.json``.
+
+    Args:
+        dataset_dir: Dataset root directory.
+
+    Returns:
+        The first matching training annotation file, or ``None`` if none exists.
+    """
+    root = Path(dataset_dir)
+    candidates = [
+        root / "train" / "_annotations.coco.json",
+        root / "train" / "uv" / "_annotations.coco.json",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def is_valid_coco_dataset(dataset_dir: str) -> bool:
-    return (Path(dataset_dir) / "train" / "_annotations.coco.json").exists()
+    return resolve_coco_train_annotation_file(dataset_dir) is not None
 
 
 def compute_multi_scale_scales(

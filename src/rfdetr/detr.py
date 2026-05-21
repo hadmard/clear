@@ -36,7 +36,7 @@ from rfdetr.config import (
     ModelConfig,
     TrainConfig,
 )
-from rfdetr.datasets.coco import is_valid_coco_dataset
+from rfdetr.datasets.coco import is_valid_coco_dataset, resolve_coco_train_annotation_file
 from rfdetr.datasets.yolo import is_valid_yolo_dataset
 from rfdetr.inference import ModelContext, _build_model_context
 from rfdetr.utilities.decorators import deprecated
@@ -1043,8 +1043,8 @@ class RFDETR:
     @staticmethod
     def _load_classes(dataset_dir: str) -> list[str]:
         """Load class names from a COCO or YOLO dataset directory."""
-        if is_valid_coco_dataset(dataset_dir):
-            coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
+        coco_path = resolve_coco_train_annotation_file(dataset_dir)
+        if coco_path is not None:
             with open(coco_path, encoding="utf-8") as f:
                 anns = json.load(f)
             categories = sorted(anns["categories"], key=lambda category: category.get("id", float("inf")))
@@ -1094,8 +1094,8 @@ class RFDETR:
         ``coco.cats`` used by the training datamodule). For YOLO-style datasets
         it falls back to ``_load_classes``.
         """
-        if is_valid_coco_dataset(dataset_dir):
-            coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
+        coco_path = resolve_coco_train_annotation_file(dataset_dir)
+        if coco_path is not None:
             with open(coco_path, encoding="utf-8") as f:
                 anns = json.load(f)
             categories = anns["categories"]
