@@ -413,6 +413,11 @@ L_gate_sparse = mean(gate)
 
 ```text
 variant = "small"
+initialization = "dinov2_backbone_only"
+pretrain_weights = None
+patch_size = 14
+positional_encoding_size = 37
+resolution = 560
 epochs = 120
 batch_size = 4
 grad_accum_steps = 2
@@ -423,24 +428,36 @@ num_workers = 8
 multi_scale = True
 use_ema = True
 early_stopping = True
-early_stopping_patience = 20
+early_stopping_patience = 50
 checkpoint_interval = 5
 ```
+
+初始化含义：
+
+```text
+DINOv2 backbone = original DINOv2 pretrained weights
+RF-DETR projector / decoder / query / heads = random init
+Ref-UV reference branch = random init
+all parameters = trainable
+```
+
+这个模式通过 `--backbone-only-dinov2` 控制。关闭它并传入
+`--pretrain-weights` 时，才走完整 RF-DETR detector checkpoint fine-tuning。
 
 全局有效 batch：
 
 ```text
-4 per GPU * 2 grad accumulation * 2 GPUs = 16
+8 per GPU * 1 grad accumulation * 2 GPUs = 16
 ```
 
 学习率策略：
 
 ```text
-lr = 1e-4
-lr_encoder = 1.5e-4
-warmup_epochs = 1.0
+lr = 2e-4
+lr_encoder = 5e-5
+warmup_epochs = 5.0
 lr_scheduler = "cosine"
-lr_min_factor = 0.05
+lr_min_factor = 0.20
 ```
 
 RF-DETR 当前 scheduler 是 step-level `LambdaLR`：
@@ -454,10 +471,10 @@ cosine 阶段:
             + (1 - lr_min_factor) * 0.5 * (1 + cos(pi * progress))
 ```
 
-因此 warmup 后主学习率从 `1e-4` 平滑下降到：
+因此 warmup 后主学习率从 `2e-4` 平滑下降到：
 
 ```text
-1e-4 * 0.05 = 5e-6
+2e-4 * 0.20 = 4e-5
 ```
 
 输出目录默认按启动时间生成：
@@ -468,8 +485,8 @@ output/ref_uv_small_2x4090/YYYYMMDD_HHMMSS
 
 建议先用 `train_uv_teacher.py` 训练纯 UV teacher，再把
 `checkpoint_best_total.pth` 传给 `train_ref_uv.py` 的 `--teacher-checkpoint`。
-teacher 脚本保持官方 `model.train(...)` 接口，默认使用 `batch_size=8`、
-`grad_accum_steps=1`、`devices=2`，同样保持全局有效 batch 为 16。
+teacher 脚本保持官方 `model.train(...)` 接口，默认使用 `batch_size=4`、
+`grad_accum_steps=2`、`devices=2`，同样保持全局有效 batch 为 16。
 
 ## 10. 为什么这个结构比简单融合更合理
 

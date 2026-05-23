@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn.functional as F  # noqa: N812 -- project-conventional alias
 
+from ref_uv_detr.initialization import load_rfdetr_backbone_weights
 from ref_uv_detr.modeling import RefUVConfig, RefUVLWDETR
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.models.lwdetr import build_model_from_config
@@ -112,12 +113,17 @@ class RefUVModelModule(RFDETRModelModule):
         *,
         ref_uv_config: Optional[RefUVConfig] = None,
         teacher_checkpoint: Optional[str | Path] = None,
+        rfdetr_backbone_weights: Optional[str | Path] = None,
         lambda_teacher_cls: float = 0.2,
         lambda_teacher_box: float = 0.5,
         lambda_prior: float = 0.05,
         lambda_gate: float = 0.001,
     ) -> None:
         super().__init__(model_config, train_config)
+        if rfdetr_backbone_weights is not None:
+            # Load only the official detector encoder before wrapping the base
+            # LWDETR model. Projector/decoder/query/head parameters stay task-random.
+            load_rfdetr_backbone_weights(self.model, self.model_config, str(rfdetr_backbone_weights))
         self.model = RefUVLWDETR(self.model, ref_uv_config or RefUVConfig())
         self.lambda_teacher_cls = lambda_teacher_cls
         self.lambda_teacher_box = lambda_teacher_box

@@ -475,7 +475,10 @@ class COCOEvalCallback(Callback):
                 return "—"
             return f"{v:.4f}"
 
-        console = Console(force_terminal=True)
+        # Do not force terminal colors here: training is often launched with
+        # nohup or viewed from log files, where ANSI escape codes make the
+        # metric tables hard to read.
+        console = Console(force_terminal=False, color_system=None, no_color=True)
         title_pfx = split.capitalize()
 
         def _render_all() -> None:
