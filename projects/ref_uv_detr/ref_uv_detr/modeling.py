@@ -8,9 +8,9 @@
 """Ref-UV DETR model wrapper.
 
 This module keeps RF-DETR's UV backbone and decoder intact, then adds a narrow
-reference path that can only affect decoder queries through query-level tokens.
-That is the main guardrail against the raw white image polluting UV fluorescence
-semantics.
+reference path that can only affect decoder queries through aligned,
+query-level tokens.  That is the main guardrail against the raw white image
+polluting UV fluorescence semantics.
 """
 
 from __future__ import annotations
@@ -44,6 +44,8 @@ class RefUVConfig:
 
     Args:
         prior_channels: Number of RNFR/white-structure prior channels.
+        max_alignment_offset_px: Maximum learned alignment offset per feature
+            level, in feature-map pixels.
         max_cls_beta: Absolute cap for reference influence on classification.
         max_box_beta: Absolute cap for reference influence on localization.
         gate_bias: Initial reliability-gate bias. Negative values make the
@@ -51,6 +53,7 @@ class RefUVConfig:
     """
 
     prior_channels: int = REFERENCE_PRIOR_CHANNELS
+    max_alignment_offset_px: float = 2.0
     max_cls_beta: float = 0.10
     max_box_beta: float = 0.30
     gate_bias: float = -2.0
@@ -108,8 +111,79 @@ class WhiteReferencedResidualTokenizer(nn.Module):
         return levels, lesion_logits
 
 
+class MisalignmentAwareReferenceAlignment(nn.Module):
+    """Align white-reference prior features to UV detector features.
+
+    Args:
+        hidden_dim: Detector hidden dimension.
+        num_levels: Number of feature levels.
+        max_offset_px: Maximum offset in feature-map pixels.
+    """
+
+    def __init__(self, hidden_dim: int, num_levels: int, max_offset_px: float) -> None:
+        super().__init__()
+        self.max_offset_px = max_offset_px
+        self.offset_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=3, padding=1),
+                    _group_norm(hidden_dim),
+                    nn.GELU(),
+                    nn.Conv2d(hidden_dim, 2, kernel_size=3, padding=1),
+                )
+                for _ in range(num_levels)
+            ]
+        )
+        for head in self.offset_heads:
+            nn.init.zeros_(head[-1].weight)
+            nn.init.zeros_(head[-1].bias)
+
+    @staticmethod
+    def _base_grid(batch_size: int, height: int, width: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        """Build a normalized sampling grid.
+
+        Args:
+            batch_size: Batch size.
+            height: Feature-map height.
+            width: Feature-map width.
+            device: Target device.
+            dtype: Target dtype.
+
+        Returns:
+            Grid tensor with shape ``B x H x W x 2``.
+        """
+        y, x = torch.meshgrid(
+            torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype),
+            torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype),
+            indexing="ij",
+        )
+        grid = torch.stack((x, y), dim=-1)
+        return grid.unsqueeze(0).expand(batch_size, -1, -1, -1)
+
+    def forward(self, uv_features: list[Tensor], prior_features: list[Tensor]) -> list[Tensor]:
+        """Align prior features to UV features.
+
+        Args:
+            uv_features: RF-DETR UV feature maps.
+            prior_features: Reference prior feature maps.
+
+        Returns:
+            Aligned prior feature maps.
+        """
+        aligned = []
+        for uv, prior, head in zip(uv_features, prior_features, self.offset_heads):
+            batch_size, _, height, width = prior.shape
+            offsets = torch.tanh(head(torch.cat([uv, prior], dim=1))) * self.max_offset_px
+            scale_x = 2.0 / max(width - 1, 1)
+            scale_y = 2.0 / max(height - 1, 1)
+            offset_grid = torch.stack((offsets[:, 0] * scale_x, offsets[:, 1] * scale_y), dim=-1)
+            grid = self._base_grid(batch_size, height, width, prior.device, prior.dtype) + offset_grid
+            aligned.append(F.grid_sample(prior, grid, mode="bilinear", padding_mode="border", align_corners=True))
+        return aligned
+
+
 class QueryReferenceSampler(nn.Module):
-    """Sample prior features at decoder query locations.
+    """Sample aligned prior features at decoder query locations.
 
     Args:
         hidden_dim: Detector hidden dimension.
@@ -139,11 +213,11 @@ class QueryReferenceSampler(nn.Module):
         centers = boxes[..., :2].detach().clamp(0.0, 1.0)
         return (centers * 2.0 - 1.0).unsqueeze(2)
 
-    def forward(self, prior_features: list[Tensor], boxes: Tensor) -> Tensor:
+    def forward(self, aligned_features: list[Tensor], boxes: Tensor) -> Tensor:
         """Sample and aggregate query reference tokens.
 
         Args:
-            prior_features: Reference prior feature maps at detector feature resolutions.
+            aligned_features: Aligned prior feature maps.
             boxes: Query boxes in normalized ``cx, cy, w, h`` format.
 
         Returns:
@@ -152,7 +226,7 @@ class QueryReferenceSampler(nn.Module):
         grid = self._query_grid(boxes)
         weights = torch.softmax(self.level_weights, dim=0)
         samples = []
-        for feature, weight in zip(prior_features, weights):
+        for feature, weight in zip(aligned_features, weights):
             sampled = F.grid_sample(feature, grid, mode="bilinear", padding_mode="border", align_corners=True)
             sampled = sampled.squeeze(-1).transpose(1, 2)
             samples.append(sampled * weight)
@@ -262,6 +336,11 @@ class RefUVLWDETR(nn.Module):
         hidden_dim = self.transformer.d_model
         num_levels = self.transformer.num_feature_levels
         self.reference_tokenizer = WhiteReferencedResidualTokenizer(config.prior_channels, hidden_dim, num_levels)
+        self.reference_alignment = MisalignmentAwareReferenceAlignment(
+            hidden_dim,
+            num_levels,
+            config.max_alignment_offset_px,
+        )
         self.reference_sampler = QueryReferenceSampler(hidden_dim, num_levels)
         self.reference_gate = LesionAwareReferenceGate(hidden_dim, config.gate_bias)
         self.reference_update = ReferenceQueryUpdate(hidden_dim)
@@ -340,11 +419,6 @@ class RefUVLWDETR(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Compute reference update, gate, and lesion logits for final queries.
 
-        The white-reference prior is sampled directly at the UV query centers.
-        There is intentionally no learned spatial alignment block in this
-        ablation, so the reference branch is simpler and easier to compare
-        against the earlier alignment-enabled run.
-
         Args:
             srcs: UV feature maps.
             prior_batch: Padded RNFR prior tensor.
@@ -356,7 +430,8 @@ class RefUVLWDETR(nn.Module):
         """
         level_shapes = [(src.shape[-2], src.shape[-1]) for src in srcs]
         prior_features, lesion_logits = self.reference_tokenizer(prior_batch, level_shapes)
-        reference = self.reference_sampler(prior_features, boxes)
+        aligned_prior = self.reference_alignment(srcs, prior_features)
+        reference = self.reference_sampler(aligned_prior, boxes)
         class_confidence = torch.sigmoid(self.class_embed(query)).amax(dim=-1, keepdim=True)
         lesionness = self._sample_scalar_map(lesion_logits, boxes)
         gate = self.reference_gate(query, reference, class_confidence, boxes, lesionness)

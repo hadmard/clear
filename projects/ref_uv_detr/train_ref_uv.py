@@ -17,6 +17,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 from ref_uv_detr.data import PairedRFDETRDataModule
+from ref_uv_detr.initialization import (
+    apply_dinov2_backbone_only_init,
+    apply_rfdetr_backbone_only_init,
+    dinov2_backbone_only_notes,
+    rfdetr_backbone_only_notes,
+)
 from ref_uv_detr.modeling import RefUVConfig
 from ref_uv_detr.training import RefUVModelModule
 
@@ -58,6 +64,13 @@ TRAINING_DEFAULTS: dict[str, Any] = {
     "variant": "small",
     "resolution": None,
     "pretrain_weights": None,
+    "backbone_pretrain_weights": None,
+    # Default to the stronger clean initialization experiment: official RF-DETR
+    # checkpoint encoder only, with projector/detector/reference modules random
+    # at step 0.
+    "backbone_only_rfdetr": True,
+    # Keep the earlier baseline available for ablations.
+    "backbone_only_dinov2": True,
     "teacher_checkpoint": None,
     # The Ref-UV branch loads an extra reference path and, when enabled, a
     # frozen UV teacher. Give it a longer ceiling than the pure teacher, and
@@ -161,6 +174,30 @@ def parse_args() -> argparse.Namespace:
         "--pretrain-weights",
         default=TRAINING_DEFAULTS["pretrain_weights"],
         help="Optional initial RF-DETR checkpoint.",
+    )
+    parser.add_argument(
+        "--backbone-pretrain-weights",
+        default=TRAINING_DEFAULTS["backbone_pretrain_weights"],
+        help="Optional official RF-DETR checkpoint used only as a backbone source.",
+    )
+    parser.add_argument(
+        "--backbone-only-rfdetr",
+        action=argparse.BooleanOptionalAction,
+        default=TRAINING_DEFAULTS["backbone_only_rfdetr"],
+        help=(
+            "Initialize only backbone encoder weights from an official RF-DETR checkpoint. "
+            "Projector, decoder, queries, heads, and Ref-UV modules remain randomly initialized."
+        ),
+    )
+    parser.add_argument(
+        "--backbone-only-dinov2",
+        action=argparse.BooleanOptionalAction,
+        default=TRAINING_DEFAULTS["backbone_only_dinov2"],
+        help=(
+            "Initialize only the DINOv2 backbone from its original pretrained weights. "
+            "Ignored when --backbone-only-rfdetr is enabled. Providing --pretrain-weights "
+            "takes precedence and uses full RF-DETR checkpoint fine-tuning."
+        ),
     )
     parser.add_argument(
         "--no-pretrain",
@@ -356,18 +393,44 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, TrainConfig]:
         Tuple of model and train configs.
     """
     model_kwargs: dict[str, Any] = {}
-    if args.resolution is not None:
-        model_kwargs["resolution"] = args.resolution
-    if args.no_pretrain:
-        model_kwargs["pretrain_weights"] = None
     if args.pretrain_weights is not None:
+        if args.resolution is not None:
+            model_kwargs["resolution"] = args.resolution
         model_kwargs["pretrain_weights"] = args.pretrain_weights
+    elif args.backbone_only_rfdetr and not args.no_pretrain:
+        rfdetr_backbone_source = apply_rfdetr_backbone_only_init(
+            model_kwargs,
+            config_cls=_MODEL_CONFIGS[args.variant],
+            source_weights=args.backbone_pretrain_weights,
+            resolution=args.resolution,
+        )
+    elif args.backbone_only_dinov2 and not args.no_pretrain:
+        apply_dinov2_backbone_only_init(model_kwargs, resolution=args.resolution)
+    else:
+        if args.resolution is not None:
+            model_kwargs["resolution"] = args.resolution
+        if args.no_pretrain:
+            model_kwargs["pretrain_weights"] = None
     model_config = _MODEL_CONFIGS[args.variant](**model_kwargs)
     _expand_and_download_pretrain(model_config)
 
     num_classes = RFDETR._detect_num_classes_for_training(args.dataset_dir)
     model_config.num_classes = num_classes
     model_config.model_name = f"RefUV-{args.variant}"
+
+    notes: dict[str, Any] = {
+        "method": "Ref-UV DETR",
+        "white_reference_dir": str(Path(args.white_dir).expanduser()),
+        "teacher_checkpoint": args.teacher_checkpoint,
+    }
+    if args.pretrain_weights is not None:
+        notes["initialization"] = "rfdetr_full_detector_checkpoint"
+    elif args.backbone_only_rfdetr and not args.no_pretrain:
+        notes.update(rfdetr_backbone_only_notes(rfdetr_backbone_source))
+    elif args.backbone_only_dinov2 and not args.no_pretrain:
+        notes.update(dinov2_backbone_only_notes())
+    else:
+        notes["initialization"] = "no_rfdetr_checkpoint"
 
     train_config = TrainConfig(
         dataset_dir=args.dataset_dir,
@@ -405,11 +468,7 @@ def build_configs(args: argparse.Namespace) -> tuple[ModelConfig, TrainConfig]:
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
         run_test=TRAINING_DEFAULTS["run_test"] or args.run_test,
         augmentation_backend="cpu",
-        notes={
-            "method": "Ref-UV DETR",
-            "white_reference_dir": str(Path(args.white_dir).expanduser()),
-            "teacher_checkpoint": args.teacher_checkpoint,
-        },
+        notes=notes,
     )
     return model_config, train_config
 
@@ -450,6 +509,12 @@ def main() -> None:
         train_config,
         ref_uv_config=ref_uv_config,
         teacher_checkpoint=args.teacher_checkpoint,
+        rfdetr_backbone_weights=(
+            train_config.notes.get("rfdetr_backbone_source")
+            if isinstance(train_config.notes, dict)
+            and train_config.notes.get("initialization") == "rfdetr_backbone_only"
+            else None
+        ),
         lambda_teacher_cls=args.lambda_teacher_cls,
         lambda_teacher_box=args.lambda_teacher_box,
         lambda_prior=args.lambda_prior,

@@ -84,31 +84,42 @@ conda run -n rfdetr env PYTHONPATH=src \
 The current defaults are conservative fine-tuning values:
 
 ```text
-output_dir="output/uv_teacher_2x4090/YYYYMMDD_HHMMSS"
+output_dir="output/uv_dinov2_only_tuned/YYYYMMDD_HHMMSS"
 variant="small"
+initialization="dinov2_backbone_only"
+pretrain_weights=None
+patch_size=14
+positional_encoding_size=37
+resolution=560
 epochs=120
-batch_size=8
-grad_accum_steps=1
-lr=1e-4
-lr_encoder=1.5e-4
-warmup_epochs=1.0
+batch_size=4
+grad_accum_steps=2
+lr=2e-4
+lr_encoder=5e-5
+warmup_epochs=5.0
 lr_scheduler="cosine"
-lr_min_factor=0.05
+lr_min_factor=0.20
 device/accelerator="gpu"
 devices=2
 strategy="ddp_find_unused_parameters_true"
 early_stopping=True
-early_stopping_patience=18
+early_stopping_patience=50
 early_stopping_use_ema=True
 checkpoint_interval=5
 ```
 
 This gives a global effective batch size of `8 * 1 * 2 = 16`, matching
-RF-DETR's documented multi-GPU recommendation. After training, use the best
+RF-DETR's documented multi-GPU recommendation. The initialization intentionally
+loads only the original DINOv2 visual backbone weights; RF-DETR's projector,
+decoder, query embeddings, and detection heads start random and are trained
+from the first optimizer step. Use `--no-backbone-only-dinov2` only when you
+want RF-DETR's full detector checkpoint fine-tuning path instead.
+
+After training, use the best
 teacher artifact, usually:
 
 ```text
-output/uv_teacher_2x4090/<timestamp>/checkpoint_best_total.pth
+output/uv_dinov2_only_tuned/<timestamp>/checkpoint_best_total.pth
 ```
 
 ### 2. Train Ref-UV DETR
@@ -121,7 +132,7 @@ conda run -n rfdetr env PYTHONPATH=projects/ref_uv_detr:src \
     --dataset-dir /path/to/dataset_uv \
     --white-dir /path/to/dataset_white \
     --variant small \
-    --teacher-checkpoint output/uv_teacher_2x4090/<timestamp>/checkpoint_best_total.pth \
+    --teacher-checkpoint output/uv_dinov2_only_tuned/<timestamp>/checkpoint_best_total.pth \
     --epochs 120 \
     --batch-size 4 \
     --grad-accum-steps 2 \
@@ -141,11 +152,16 @@ extra VRAM headroom for the reference branch and frozen teacher:
 
 ```text
 output_dir="output/ref_uv_small_2x4090/YYYYMMDD_HHMMSS"
+initialization="dinov2_backbone_only"
+pretrain_weights=None
+patch_size=14
+positional_encoding_size=37
+resolution=560
 device="gpu"
 devices=2
 strategy="ddp_find_unused_parameters_true"
-batch_size=4
-grad_accum_steps=2
+batch_size=8
+grad_accum_steps=1
 lr=1e-4
 lr_encoder=1.5e-4
 warmup_epochs=1.0
