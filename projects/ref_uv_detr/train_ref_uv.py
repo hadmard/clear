@@ -93,8 +93,8 @@ TRAINING_DEFAULTS: dict[str, Any] = {
     "num_workers": 8,
     "device": "gpu",
     "devices": 2,
-    # beta_cls/beta_box intentionally start at zero, so early DDP steps can
-    # leave parts of the reference branch without gradients.
+    # Some reference parameters can be lightly used early on; keep the unused
+    # parameter tolerant DDP strategy while we run fusion ablations.
     "strategy": "ddp_find_unused_parameters_true",
     "uv_token": "uv",
     "white_token": "white",
@@ -102,9 +102,12 @@ TRAINING_DEFAULTS: dict[str, Any] = {
     "lambda_teacher_cls": 0.2,
     "lambda_teacher_box": 0.5,
     "lambda_prior": 0.05,
-    "lambda_gate": 0.001,
+    # Keep gate sparsity off for the student-only comparison so the reference
+    # path is not closed before it learns useful attention.
+    "lambda_gate": 0.0,
     "max_cls_beta": 0.10,
     "max_box_beta": 0.30,
+    "initial_ref_beta": 0.03,
     "multi_scale": True,
     "use_ema": True,
     "checkpoint_interval": 5,
@@ -313,13 +316,19 @@ def parse_args() -> argparse.Namespace:
         "--max-cls-beta",
         type=float,
         default=TRAINING_DEFAULTS["max_cls_beta"],
-        help="Classification reference cap.",
+        help="Compatibility option retained from head-fusion runs; decoder-only fusion does not use it.",
     )
     parser.add_argument(
         "--max-box-beta",
         type=float,
         default=TRAINING_DEFAULTS["max_box_beta"],
-        help="Box reference cap.",
+        help="Decoder reference residual cap.",
+    )
+    parser.add_argument(
+        "--initial-ref-beta",
+        type=float,
+        default=TRAINING_DEFAULTS["initial_ref_beta"],
+        help="Initial decoder reference residual strength for enabled layers.",
     )
     parser.add_argument("--no-multi-scale", action="store_true", help="Disable RF-DETR multi-scale resize.")
     parser.add_argument("--no-ema", action="store_true", help="Disable RF-DETR EMA callback.")
@@ -502,7 +511,11 @@ def main() -> None:
     """Run Ref-UV DETR training."""
     args = parse_args()
     model_config, train_config = build_configs(args)
-    ref_uv_config = RefUVConfig(max_cls_beta=args.max_cls_beta, max_box_beta=args.max_box_beta)
+    ref_uv_config = RefUVConfig(
+        max_cls_beta=args.max_cls_beta,
+        max_box_beta=args.max_box_beta,
+        initial_ref_beta=args.initial_ref_beta,
+    )
 
     module = RefUVModelModule(
         model_config,

@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from rfdetr.evaluation.f1_sweep import sweep_confidence_thresholds
 from rfdetr.evaluation.matching import (
     _compute_mask_iou,
     _match_single_class,
@@ -18,6 +19,41 @@ from rfdetr.evaluation.matching import (
     init_matching_accumulator,
     merge_matching_data,
 )
+
+# ---------------------------------------------------------------------------
+# sweep_confidence_thresholds
+# ---------------------------------------------------------------------------
+
+
+class TestSweepConfidenceThresholds:
+    """Unit tests for confidence-threshold PR/F1 sweep."""
+
+    def test_micro_f1_selects_threshold_and_reports_pr_at_that_point(self) -> None:
+        """Micro precision/recall/F1 come from the max-F1 point on the PR curve."""
+        per_class_data = [
+            _make_matching_entry([0.95, 0.80, 0.40], [1, 0, 0], [False, False, False], 1),
+        ]
+
+        results = sweep_confidence_thresholds(per_class_data, [0.0, 0.5, 0.9], [0])
+        best = max(results, key=lambda x: x["micro_f1"])
+
+        assert best["confidence_threshold"] == pytest.approx(0.9)
+        assert best["micro_precision"] == pytest.approx(1.0)
+        assert best["micro_recall"] == pytest.approx(1.0)
+        assert best["micro_f1"] == pytest.approx(1.0)
+
+    def test_micro_precision_counts_predictions_from_classes_without_gt(self) -> None:
+        """False positives from classes without GT lower global precision."""
+        per_class_data = [
+            _make_matching_entry([0.90], [1], [False], 1),
+            _make_matching_entry([0.80], [0], [False], 0),
+        ]
+
+        result = sweep_confidence_thresholds(per_class_data, [0.0], [0])[0]
+
+        assert result["micro_precision"] == pytest.approx(0.5)
+        assert result["micro_recall"] == pytest.approx(1.0)
+        assert result["micro_f1"] == pytest.approx(2.0 / 3.0)
 
 # ---------------------------------------------------------------------------
 # _compute_mask_iou

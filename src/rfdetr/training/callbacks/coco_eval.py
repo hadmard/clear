@@ -26,7 +26,7 @@ from rfdetr.utilities.box_ops import box_cxcywh_to_xyxy
 
 
 class COCOEvalCallback(Callback):
-    """Validation callback that computes mAP (via torchmetrics) and macro-F1.
+    """Validation callback that computes mAP (via torchmetrics) and F1.
 
     Accumulates predictions and targets across validation batches, then at
     epoch end computes:
@@ -34,8 +34,8 @@ class COCOEvalCallback(Callback):
     - ``val/mAP_50_95``, ``val/mAP_50``, ``val/mAP_75``, ``val/mAR`` using
       ``torchmetrics.detection.MeanAveragePrecision``.
     - Per-class ``val/AP/<name>`` when class names are available.
-    - ``val/F1``, ``val/precision``, ``val/recall`` from a confidence-threshold
-      sweep over compact per-class matching data (DDP-safe).
+    - ``val/F1``, ``val/precision``, ``val/recall`` from the confidence
+      threshold that maximizes global F1 on the IoU=0.5 PR curve.
 
     For segmentation models (``segmentation=True``) additional metrics
     ``val/segm_mAP_50_95`` and ``val/segm_mAP_50`` are logged.
@@ -326,23 +326,27 @@ class COCOEvalCallback(Callback):
         # F1 sweep — run first so per-class F1/prec/rec are available when
         # building the unified per-class table rows below.
         merged = distributed_merge_matching_data(self._f1_local)
-        # category_id → {f1, precision, recall} at the best macro-F1 threshold
+        # category_id → {f1, precision, recall} at the best global-F1 threshold
         f1_by_cid: dict[int, dict[str, float]] = {}
         if merged:
             sorted_ids = sorted(merged.keys())
             per_class_list = [merged[cid] for cid in sorted_ids]
             classes_with_gt = [i for i, cid in enumerate(sorted_ids) if merged[cid]["total_gt"] > 0]
             f1_results = sweep_confidence_thresholds(per_class_list, np.linspace(0, 1, 101), classes_with_gt)
-            best = max(f1_results, key=lambda x: x["macro_f1"])
-            overall["F1"] = float(best["macro_f1"])
-            overall["Precision"] = float(best["macro_precision"])
-            overall["Recall"] = float(best["macro_recall"])
-            pl_module.log(f"{split}/F1", float(best["macro_f1"]), prog_bar=True)
-            pl_module.log(f"{split}/precision", float(best["macro_precision"]))
-            pl_module.log(f"{split}/recall", float(best["macro_recall"]))
-            trainer.callback_metrics[f"{split}/F1"] = torch.tensor(float(best["macro_f1"]))
-            trainer.callback_metrics[f"{split}/precision"] = torch.tensor(float(best["macro_precision"]))
-            trainer.callback_metrics[f"{split}/recall"] = torch.tensor(float(best["macro_recall"]))
+            best = max(f1_results, key=lambda x: x["micro_f1"])
+            best_confidence = float(best["confidence_threshold"])
+            overall["F1"] = float(best["micro_f1"])
+            overall["Precision"] = float(best["micro_precision"])
+            overall["Recall"] = float(best["micro_recall"])
+            overall["Confidence"] = best_confidence
+            pl_module.log(f"{split}/F1", float(best["micro_f1"]), prog_bar=True)
+            pl_module.log(f"{split}/precision", float(best["micro_precision"]))
+            pl_module.log(f"{split}/recall", float(best["micro_recall"]))
+            pl_module.log(f"{split}/confidence_threshold", best_confidence)
+            trainer.callback_metrics[f"{split}/F1"] = torch.tensor(float(best["micro_f1"]))
+            trainer.callback_metrics[f"{split}/precision"] = torch.tensor(float(best["micro_precision"]))
+            trainer.callback_metrics[f"{split}/recall"] = torch.tensor(float(best["micro_recall"]))
+            trainer.callback_metrics[f"{split}/confidence_threshold"] = torch.tensor(best_confidence)
             for k, cid in enumerate(sorted_ids):
                 f1_by_cid[cid] = {
                     "f1": float(best["per_class_f1"][k]),
@@ -353,12 +357,15 @@ class COCOEvalCallback(Callback):
             overall["F1"] = 0.0
             overall["Precision"] = 0.0
             overall["Recall"] = 0.0
+            overall["Confidence"] = 0.0
             pl_module.log(f"{split}/F1", 0.0, prog_bar=True)
             pl_module.log(f"{split}/precision", 0.0)
             pl_module.log(f"{split}/recall", 0.0)
+            pl_module.log(f"{split}/confidence_threshold", 0.0)
             trainer.callback_metrics[f"{split}/F1"] = torch.tensor(0.0)
             trainer.callback_metrics[f"{split}/precision"] = torch.tensor(0.0)
             trainer.callback_metrics[f"{split}/recall"] = torch.tensor(0.0)
+            trainer.callback_metrics[f"{split}/confidence_threshold"] = torch.tensor(0.0)
 
         # torchmetrics returns `classes` as a 0-d scalar when only one class is
         # present in the batch.  Ensure it is always 1-d before iterating.
@@ -450,7 +457,7 @@ class COCOEvalCallback(Callback):
         The overall table is transposed (metrics as columns, one value row) with
         true merged group-header cells rendered via box-drawing characters:
         ``mAP`` spans sub-columns 50:95 / 50 / 75, ``mAR`` spans ``@N``, and
-        ``F1 sweep`` spans F1 / Prec / Recall.  The per-class table uses a
+        ``F1 sweep`` spans F1 / Prec / Recall / Conf.  The per-class table uses a
         standard Rich ``Table`` with columns for AP 50:95, AR, F1, Prec, Recall.
 
         Only runs on the global-zero rank to avoid duplicate output in DDP.
@@ -542,11 +549,11 @@ class COCOEvalCallback(Callback):
 
                         Val — Overall Metrics
             ┏━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━┓
-            ┃          mAP          ┃   mAR   ┃        F1 sweep       ┃
+            ┃          mAP          ┃   mAR   ┃          F1 sweep           ┃
             ┡━━━━━━━━━┳━━━━━━┳━━━━━━╇━━━━━━━━━╇━━━━━━┳━━━━━━┳━━━━━━━━━┩
-            │  50:95  │  50  │  75  │  @500   │  F1  │ Prec │ Recall  │
+            │  50:95  │  50  │  75  │  @500   │  F1  │ Prec │ Recall  │ Conf │
             ├─────────┼──────┼──────┼─────────┼──────┼──────┼─────────┤
-            │    —    │0.1510│0.1228│  0.4017 │0.1573│0.2607│  0.1562 │
+            │    —    │0.1510│0.1228│  0.4017 │0.1573│0.2607│  0.1562 │0.3000│
             └─────────┴──────┴──────┴─────────┴──────┴──────┴─────────┘
 
         Args:
@@ -582,6 +589,7 @@ class COCOEvalCallback(Callback):
                     ("F1", _fmt(overall["F1"])),
                     ("Prec", _fmt(overall["Precision"])),
                     ("Recall", _fmt(overall["Recall"])),
+                    ("Conf", _fmt(overall["Confidence"])),
                 ],
             ),
         ]

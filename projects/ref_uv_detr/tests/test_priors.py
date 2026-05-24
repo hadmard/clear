@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import numpy as np
-from ref_uv_detr.priors import REFERENCE_PRIOR_CHANNELS, build_reference_prior
+from ref_uv_detr.priors import REFERENCE_PRIOR_CHANNELS, REFERENCE_PRIOR_NAMES, build_reference_prior
 
 
 def test_reference_prior_shape_and_finiteness() -> None:
@@ -23,8 +23,18 @@ def test_reference_prior_shape_and_finiteness() -> None:
 
     assert prior.shape == (REFERENCE_PRIOR_CHANNELS, 32, 40)
     assert np.isfinite(prior).all()
-    assert prior[8].max() > 0.0
-    assert prior[9:].max() == 0.0
+    assert REFERENCE_PRIOR_NAMES == (
+        "rnfr_r",
+        "rnfr_g",
+        "rnfr_b",
+        "exb_residual",
+        "white_edge",
+        "white_raw_r",
+        "white_raw_g",
+        "white_raw_b",
+    )
+    assert prior[4].max() > 0.0
+    assert prior[5:].max() > 0.0
 
 
 def test_reference_prior_is_centered_for_identical_images() -> None:

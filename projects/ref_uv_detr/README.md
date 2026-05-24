@@ -8,19 +8,19 @@ The implementation is intentionally isolated from the RF-DETR source tree. It re
 
 White light is treated as a same-leaf structural reference, not as a second disease-recognition modality.
 
-Ref-UV DETR therefore keeps the UV backbone/decoder as the semantic path and only lets white-derived evidence influence final detection through:
+Ref-UV DETR therefore keeps the UV backbone and RF-DETR heads as the semantic path and only lets white-derived evidence influence object queries inside the decoder:
 
 1. **Reference-Normalized Fluorescence Residual (RNFR)**
     `log((UV + eps) / (White + eps))`, centered by the leaf-level median.
 
-2. **Misalignment-aware reference alignment**
-    A small offset head aligns RNFR/white-structure features to each RF-DETR UV feature level.
+2. **Compact reference prior**
+    The reference encoder consumes RNFR RGB, the existing ExB residual, white edge, and raw white RGB.
 
-3. **Lesion-aware query-level gated fusion**
-    Each DETR query samples its own aligned reference token and predicts its own reliability gate.
+3. **Decoder-level deformable fusion**
+    Decoder layers keep the UV deformable cross-attention and add an independent reference deformable cross-attention branch.
 
-4. **Classification/localization decoupling**
-    Learnable capped `beta_cls` and `beta_box` start at zero. By default, `|beta_cls| <= 0.10` and `|beta_box| <= 0.30`, so white can help localization more than classification.
+4. **Query-level reference gate**
+    Each query predicts whether to use reference evidence. Decoder beta starts at zero, so training begins equivalent to UV-only.
 
 5. **UV teacher preservation**
     An optional pure-UV checkpoint supplies classification and box distillation losses so fusion cannot casually forget the UV-only model.
