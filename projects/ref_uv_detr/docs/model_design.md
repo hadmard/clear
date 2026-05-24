@@ -23,7 +23,7 @@
 - 不让 white 特征直接主导分类。
 - 不在未对齐的情况下做全图硬融合。
 
-模型只允许 white 派生出的参考 prior 在最后 decoder query 阶段，以 query-level gate 的方式小幅修正分类和定位。这个限制是为了防止 white 的纹理、光照、背景信息污染 UV-only 检测能力。
+模型只允许 white 派生出的参考 prior 进入 decoder cross-attention，以 query-level gate 的方式影响 object query。这个限制是为了防止 white 的纹理、光照、背景信息绕过 decoder 直接污染分类/定位 head。
 
 ## 2. 总体结构
 
@@ -32,31 +32,30 @@
 ```text
 UV image
   -> RF-DETR backbone
-  -> RF-DETR transformer decoder
-  -> UV decoder queries
-  -> UV-only class logits and boxes
+  -> UV multi-scale memory
 
 UV image + White image
-  -> Reference-Normalized Fluorescence Residual / white structure maps
-  -> reference tokenizer
+  -> RNFR / ExB / white edge / raw white RGB
+  -> lightweight reference encoder
   -> misalignment-aware alignment
-  -> query-centered reference sampling
-  -> query-level reference gate
+  -> reference multi-scale memory
 
-final query
-  -> classification-localization decoupled fusion
-  -> final logits and boxes
+RF-DETR decoder layer
+  -> query self-attention
+  -> UV deformable cross-attention
+  -> reference deformable cross-attention with independent offsets
+  -> query-level gate
+  -> shared FFN
+  -> original RF-DETR class / box heads
 ```
 
-更具体地说，代码里的主模型是 `RefUVLWDETR`。它包装一个已经由 RF-DETR 官方构建好的 `LWDETR` 模型，然后复用原始模型的 backbone、transformer、class head、box head、query embedding、reference point embedding、aux loss 和 two-stage 逻辑。
+更具体地说，代码里的主模型是 `RefUVLWDETR`。它包装一个已经由 RF-DETR 官方构建好的 `LWDETR` 模型，然后复用原始模型的 backbone、class head、box head、query embedding、reference point embedding、aux loss 和 two-stage 逻辑。新增 reference 只进入 decoder cross-attention，不再做 head 前 `q_cls/q_box` 融合。
 
 新增的模块只有参考分支：
 
 - `WhiteReferencedResidualTokenizer`
 - `MisalignmentAwareReferenceAlignment`
-- `QueryReferenceSampler`
-- `LesionAwareReferenceGate`
-- `ReferenceQueryUpdate`
+- `ReferenceFusionDecoderLayer`
 
 这使得当前项目仍然尽量复用 RF-DETR 官方训练接口、优化器分组、criterion、postprocess、callback 和 Lightning trainer。
 
@@ -136,20 +135,17 @@ white 配对查找逻辑会尝试：
 
 ## 4. Reference-Normalized Fluorescence Residual
 
-当前 prior 构造在 `build_reference_prior()` 中完成，一共 11 个通道：
+当前 prior 构造在 `build_reference_prior()` 中完成，一共 8 个通道：
 
 ```text
 rnfr_r
 rnfr_g
 rnfr_b
-uv_minus_white_r
-uv_minus_white_g
-uv_minus_white_b
-log_bg_residual
 exb_residual
 white_edge
-white_leaf_mask
-white_distance_to_boundary
+white_raw_r
+white_raw_g
+white_raw_b
 ```
 
 ### 4.1 RNFR
@@ -167,23 +163,16 @@ RNFR_c(x) = R_c(x) - median(R_c over leaf region)
 
 ### 4.2 辅助残差通道
 
-除 RNFR 外，还加入了：
-
-- `UV - White` RGB 残差。
-- `log(UV_B / UV_G) - log(White_B / White_G)`。
-- `ExB_UV - ExB_White`，其中 `ExB = 2B - G - R`。
-
-这些通道偏向描述蓝通道/荧光响应异常，帮助 prior encoder 获取病斑候选区域。
+除 RNFR 外，只保留当前代码中已有、最贴近 UV 荧光异常的 `ExB_UV - ExB_White`，其中 `ExB = 2B - G - R`。这个通道偏向描述蓝通道响应异常，帮助 reference encoder 获取病斑候选区域。
 
 ### 4.3 white 结构通道
 
-white 还提供三个结构图：
+white 还提供一个结构图和三通道原始参考图：
 
 - `white_edge`：白光灰度 Sobel 边缘。
-- `white_leaf_mask`：白光估计出的叶片区域。
-- `white_distance_to_boundary`：叶片内部到边界的归一化距离。
+- `white_raw_r/g/b`：经过同样几何增强后的白光 RGB，作为 reference encoder 的结构纹理输入。
 
-它们的作用不是分类病害，而是帮助模型理解边界、叶片外背景、叶缘伪影和结构定位。
+它们的作用不是分类病害，而是帮助 decoder 在 cross-attention 里理解边界、叶片外背景、叶缘伪影和结构定位。
 
 ## 5. 参考分支模块
 
@@ -192,7 +181,7 @@ white 还提供三个结构图：
 输入：
 
 ```text
-B x 11 x H x W reference prior
+B x 8 x H x W reference prior
 ```
 
 输出：
@@ -202,7 +191,7 @@ multi-scale prior features
 dense lesionness logits
 ```
 
-实现上，它先用一个小 CNN stem 编码 11 通道 prior，再根据 RF-DETR 当前特征层的分辨率，把 prior feature resize 到每个 feature level，并通过 `1x1 Conv + GroupNorm + GELU` 投影到 RF-DETR hidden dimension。
+实现上，它先用一个小 CNN stem 编码 8 通道 prior，再根据 RF-DETR 当前特征层的分辨率，把 prior feature resize 到每个 feature level，并通过 `1x1 Conv + GroupNorm + GELU` 投影到 RF-DETR hidden dimension。
 
 额外的 `lesion_head` 会输出一个 dense lesionness logit map，用于：
 
@@ -222,108 +211,44 @@ offset 被 `tanh` 限制，并乘以 `max_alignment_offset_px`。默认最大偏
 
 最后一个 offset conv 初始化为 0，所以训练一开始等价于不做位移。这样模型不会在初期因为随机 offset 把 reference prior 采乱。
 
-### 5.3 QueryReferenceSampler
+### 5.3 ReferenceFusionDecoderLayer
 
-这个模块不做全图融合，而是在每个 query 的预测框中心采样 reference token。
-
-输入：
+当前版本不再做最后一层 head 前 query 采样融合，而是把 reference memory 送入 decoder layer。每层 decoder 先保持 RF-DETR 原始 self-attention 和 UV deformable cross-attention，再额外执行一条 reference deformable cross-attention：
 
 ```text
-aligned prior features
-UV-only query boxes in cx, cy, w, h
+uv_update = MSDeformAttn(query, UV memory)
+ref_update = MSDeformAttn(query, reference memory)
+gate = sigmoid(MLP(query, uv_update, ref_update, lesionness))
+query = query + uv_update + beta_l * gate * ref_update
+query = FFN(query)
 ```
 
-过程：
+reference cross-attention 有独立的 sampling offsets 和 attention weights，因此可以在 object-query 层面处理 UV/white 的轻微错位。默认从第 2 个 decoder layer 开始启用 reference，layer 0 保持 UV-only。
+
+### 5.4 Query-level gate
+
+gate 是 query-level 的可靠性判断。输入包括 decoder query、UV cross-attention update、reference cross-attention update，以及从 reference encoder 的 dense lesionness map 采样到的候选强度。
+
+默认最后一层 bias 是 `-2.0`，所以初始 gate 大约是 `sigmoid(-2) = 0.119`。同时 decoder reference beta 从 0 开始，保证训练第一步等价于 UV-only 路径。
+
+## 6. Decoder-only 融合
+
+当前版本已经去掉 head 前融合：
 
 ```text
-query center -> grid_sample from every feature level
-level softmax weight -> weighted sum
-MLP projection -> reference token
+不再使用:
+q_cls = q_uv + beta_cls * ref_update
+q_box = q_uv + beta_box * ref_update
 ```
 
-输出：
+最终预测重新回到 RF-DETR 原始形式：
 
 ```text
-r_q: B x Q x C
+outputs_class = class_embed(hs)
+outputs_coord = bbox_embed(hs)
 ```
 
-也就是说，每个候选病斑 query 自己拿到一个局部 reference token，而不是整张图被 white 全局污染。
-
-### 5.4 LesionAwareReferenceGate
-
-gate 是 query-level 的可靠性判断。
-
-输入包括：
-
-```text
-UV decoder query
-reference token
-UV class confidence
-UV query box
-sampled lesionness
-```
-
-输出：
-
-```text
-s_q = sigmoid(MLP(...))
-```
-
-默认最后一层 bias 是 `-2.0`，所以初始 gate 大约是 `sigmoid(-2) = 0.119`。这让 reference 分支在训练初期偏保守。
-
-### 5.5 ReferenceQueryUpdate
-
-参考 token 不直接替换 query，而是产生一个 additive update：
-
-```text
-u_q = MLP([q_uv, r_q]) * s_q
-```
-
-然后再分别送到分类和定位分支。
-
-## 6. 分类-定位解耦融合
-
-这是当前模型最关键的保护机制之一。
-
-最终 query 被拆成：
-
-```text
-q_cls = q_uv + beta_cls * u_q
-q_box = q_uv + beta_box * u_q
-```
-
-其中：
-
-```text
-beta_cls = max_cls_beta * tanh(beta_cls_raw)
-beta_box = max_box_beta * tanh(beta_box_raw)
-```
-
-默认：
-
-```text
-max_cls_beta = 0.10
-max_box_beta = 0.30
-beta_cls_raw = 0
-beta_box_raw = 0
-```
-
-所以模型初始时完全等价于 UV-only 的最后 query 输出；训练过程中才逐步学会是否利用 reference。并且定位分支的上限更大，分类分支的上限更小。
-
-这对应论文叙事：
-
-```text
-UV for disease semantics.
-White reference for structural localization and false-positive suppression.
-```
-
-当前实现只融合最后一层 decoder output：
-
-- 中间 aux decoder outputs 仍保持 RF-DETR 原始 UV 路径。
-- 最终 `pred_logits` 来自 `q_cls`。
-- 最终 `pred_boxes` 来自 `q_box`。
-
-这样做的好处是改动小、稳定、容易 smoke test，也更符合“white 只做受限参考”的假设。
+区别是 `hs` 已经在 decoder layer 内通过 UV memory 和 reference memory 融合过。这样 white/RNFR 只能通过 deformable cross-attention 改变 object query，不能绕过 decoder 直接进入分类/定位 head。
 
 ## 7. Forward 过程
 
@@ -331,15 +256,13 @@ White reference for structural localization and false-positive suppression.
 
 ```text
 1. samples 进入 RF-DETR backbone，得到 UV multi-scale features。
-2. features 进入 RF-DETR transformer decoder，得到 hs 和 ref_unsigmoid。
-3. 使用原始 bbox head 得到 UV-only boxes。
-4. 从 targets 中取出 ref_uv_prior，并 pad 到 batch tensor 尺寸。
-5. reference tokenizer 把 prior 编码成 multi-scale prior features。
-6. alignment 模块把 prior features 对齐到 UV features。
-7. sampler 根据最终层 UV-only boxes 的中心点采样 query reference token。
-8. gate 判断每个 query 使用 reference 的可靠程度。
-9. reference update 分别以 beta_cls、beta_box 注入分类和定位 query。
-10. class head 输出最终 logits，box head 输出最终 boxes。
+2. 从 targets 中取出 ref_uv_prior，并 pad 到 batch tensor 尺寸。
+3. reference tokenizer 把 prior 编码成 multi-scale prior features 和 lesion logits。
+4. alignment 模块把 prior features 对齐到 UV features。
+5. aligned prior features 被 flatten 成 reference memory，并挂到 decoder fusion layers。
+6. RF-DETR transformer decoder 在每层 cross-attention 中融合 UV memory 和 reference memory。
+7. decoder 输出融合后的 hs 和 ref_unsigmoid。
+8. 原始 class head 和 box head 输出最终 logits / boxes。
 ```
 
 如果推理或某些调用没有传入 `targets`，模型会构造全 0 prior。这样不会崩，但也意味着 reference 分支没有实际信息。因此当前 paired validation/test/predict 都在 `RefUVModelModule` 中显式调用：
@@ -502,11 +425,11 @@ UV feature + white feature -> detector
 
 ```text
 white 不直接进主干
-white 不直接改写所有 query
-white 先变成 RNFR/结构 prior
+white 不直接进 head
+white 先变成 RNFR/ExB/edge/raw-white reference prior
 reference prior 先对齐再使用
-每个 query 自己决定是否使用 reference
-分类和定位分开控制 reference 强度
+每个 decoder query 自己决定是否使用 reference cross-attention
+reference beta 从 0 起步，按 decoder 层保守放开
 teacher loss 约束模型不忘掉 UV-only
 ```
 
@@ -516,11 +439,11 @@ teacher loss 约束模型不忘掉 UV-only
 
 这个版本已经可以作为论文主模型原型，但还需要清楚它目前的边界：
 
-1. 参考融合只发生在最后一层 decoder query 上。
-    这更稳定，也更容易超过 UV-only；后续如果数据量足够，可以尝试逐层 decoder fusion。
+1. 参考融合发生在 decoder cross-attention 内，默认第 1 层保持 UV-only，后续层逐步引入 reference。
+    这比 head 前融合更贴近 DAMSDet/MS-DETR 的 object-level fusion，也能保留 RF-DETR 原始 head。
 
-2. alignment 是轻量 `grid_sample` offset，不是完整 deformable attention。
-    目前足够表达弱错位，且计算开销小。
+2. reference 分支同时有轻量 `grid_sample` alignment 和独立 deformable offsets。
+    前者给 reference memory 一个温和对齐起点，后者在 query 级别处理剩余错位。
 
 3. lesion prior 是 box rasterization，不是真实 lesion mask。
     它是粗监督，不能被解释为像素级病斑分割。
@@ -528,7 +451,7 @@ teacher loss 约束模型不忘掉 UV-only
 4. 推理时必须能拿到 paired white 图并生成 prior。
     如果不传 reference prior，模型会退化到全 0 prior 路径。
 
-5. `beta_cls` 和 `beta_box` 初始为 0。
+5. decoder reference beta 初始为 0。
     这对稳定性很好，但 DDP 前期可能存在未使用参数，所以训练默认使用 `ddp_find_unused_parameters_true`。
 
 ## 12. 推荐实验表述

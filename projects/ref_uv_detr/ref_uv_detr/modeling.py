@@ -7,10 +7,10 @@
 
 """Ref-UV DETR model wrapper.
 
-This module keeps RF-DETR's UV backbone and decoder intact, then adds a narrow
-reference path that can only affect decoder queries through aligned,
-query-level tokens.  That is the main guardrail against the raw white image
-polluting UV fluorescence semantics.
+This module keeps RF-DETR's UV backbone, detection heads, and training API, then
+adds a narrow reference path inside the decoder cross-attention.  White/RNFR
+features therefore influence object queries before the original RF-DETR heads,
+not through a separate head-fusion shortcut.
 """
 
 from __future__ import annotations
@@ -22,6 +22,13 @@ import torch
 import torch.nn.functional as F  # noqa: N812 -- project-conventional alias
 from torch import Tensor, nn
 
+from ref_uv_detr.decoder_fusion import (
+    DecoderReferenceFusionConfig,
+    clear_decoder_reference_context,
+    collect_decoder_reference_aux,
+    enable_decoder_reference_fusion,
+    set_decoder_reference_context,
+)
 from ref_uv_detr.priors import REFERENCE_PRIOR_CHANNELS
 
 
@@ -40,23 +47,31 @@ def _group_norm(channels: int) -> nn.GroupNorm:
 
 @dataclass
 class RefUVConfig:
-    """Configuration for the reference-guided fusion path.
+    """Configuration for the decoder-level reference fusion path.
 
     Args:
-        prior_channels: Number of RNFR/white-structure prior channels.
+        prior_channels: Number of RNFR/ExB/edge/raw-white prior channels.
         max_alignment_offset_px: Maximum learned alignment offset per feature
             level, in feature-map pixels.
-        max_cls_beta: Absolute cap for reference influence on classification.
-        max_box_beta: Absolute cap for reference influence on localization.
+        max_cls_beta: Retained for older configs. Decoder-only fusion does not
+            use a separate classification head-fusion beta.
+        max_box_beta: Absolute cap for decoder reference residual strength.
+        initial_ref_beta: Initial decoder reference residual strength. A small
+            positive value gives the reference branch gradient from the first
+            epoch; ``0`` keeps a strict UV-only start.
         gate_bias: Initial reliability-gate bias. Negative values make the
             reference path conservative at the beginning of fine-tuning.
+        decoder_fusion_start_layer: First decoder layer allowed to use reference
+            cross-attention. The default keeps layer 0 UV-only.
     """
 
     prior_channels: int = REFERENCE_PRIOR_CHANNELS
     max_alignment_offset_px: float = 2.0
     max_cls_beta: float = 0.10
     max_box_beta: float = 0.30
+    initial_ref_beta: float = 0.0
     gate_bias: float = -2.0
+    decoder_fusion_start_layer: int = 1
 
 
 class WhiteReferencedResidualTokenizer(nn.Module):
@@ -182,131 +197,8 @@ class MisalignmentAwareReferenceAlignment(nn.Module):
         return aligned
 
 
-class QueryReferenceSampler(nn.Module):
-    """Sample aligned prior features at decoder query locations.
-
-    Args:
-        hidden_dim: Detector hidden dimension.
-        num_levels: Number of feature levels.
-    """
-
-    def __init__(self, hidden_dim: int, num_levels: int) -> None:
-        super().__init__()
-        self.level_weights = nn.Parameter(torch.zeros(num_levels))
-        self.proj = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    @staticmethod
-    def _query_grid(boxes: Tensor) -> Tensor:
-        """Return a grid_sample-compatible grid from normalized boxes.
-
-        Args:
-            boxes: Query boxes in normalized ``cx, cy, w, h`` format.
-
-        Returns:
-            Grid tensor with shape ``B x Q x 1 x 2``.
-        """
-        centers = boxes[..., :2].detach().clamp(0.0, 1.0)
-        return (centers * 2.0 - 1.0).unsqueeze(2)
-
-    def forward(self, aligned_features: list[Tensor], boxes: Tensor) -> Tensor:
-        """Sample and aggregate query reference tokens.
-
-        Args:
-            aligned_features: Aligned prior feature maps.
-            boxes: Query boxes in normalized ``cx, cy, w, h`` format.
-
-        Returns:
-            Query reference tokens with shape ``B x Q x C``.
-        """
-        grid = self._query_grid(boxes)
-        weights = torch.softmax(self.level_weights, dim=0)
-        samples = []
-        for feature, weight in zip(aligned_features, weights):
-            sampled = F.grid_sample(feature, grid, mode="bilinear", padding_mode="border", align_corners=True)
-            sampled = sampled.squeeze(-1).transpose(1, 2)
-            samples.append(sampled * weight)
-        return self.proj(torch.stack(samples, dim=0).sum(dim=0))
-
-
-class LesionAwareReferenceGate(nn.Module):
-    """Predict a query-level reference reliability score.
-
-    Args:
-        hidden_dim: Detector hidden dimension.
-        gate_bias: Initial bias for the final gate layer.
-    """
-
-    def __init__(self, hidden_dim: int, gate_bias: float) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 6, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-        nn.init.constant_(self.net[-1].bias, gate_bias)
-
-    def forward(
-        self,
-        query: Tensor,
-        reference: Tensor,
-        class_confidence: Tensor,
-        boxes: Tensor,
-        lesionness: Tensor,
-    ) -> Tensor:
-        """Compute query-level reference reliability.
-
-        Args:
-            query: UV decoder query tokens.
-            reference: Sampled reference tokens.
-            class_confidence: UV-only class confidence per query.
-            boxes: Query boxes in normalized ``cx, cy, w, h`` format.
-            lesionness: RNFR lesionness sampled at query centers.
-
-        Returns:
-            Gate values with shape ``B x Q x 1``.
-        """
-        features = torch.cat([query, reference, class_confidence.detach(), boxes.detach(), lesionness], dim=-1)
-        return torch.sigmoid(self.net(features))
-
-
-class ReferenceQueryUpdate(nn.Module):
-    """Produce a reference-conditioned query update.
-
-    Args:
-        hidden_dim: Detector hidden dimension.
-    """
-
-    def __init__(self, hidden_dim: int) -> None:
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-    def forward(self, query: Tensor, reference: Tensor) -> Tensor:
-        """Return an additive query update.
-
-        Args:
-            query: UV decoder query tokens.
-            reference: Query reference tokens.
-
-        Returns:
-            Update tensor with shape ``B x Q x C``.
-        """
-        return self.net(torch.cat([query, reference], dim=-1))
-
-
 class RefUVLWDETR(nn.Module):
-    """RF-DETR detector with reference-guided UV query fusion.
+    """RF-DETR detector with decoder-level reference fusion.
 
     Args:
         base_model: Fully constructed RF-DETR ``LWDETR`` model.
@@ -341,25 +233,33 @@ class RefUVLWDETR(nn.Module):
             num_levels,
             config.max_alignment_offset_px,
         )
-        self.reference_sampler = QueryReferenceSampler(hidden_dim, num_levels)
-        self.reference_gate = LesionAwareReferenceGate(hidden_dim, config.gate_bias)
-        self.reference_update = ReferenceQueryUpdate(hidden_dim)
-        self.beta_cls_raw = nn.Parameter(torch.zeros(()))
-        self.beta_box_raw = nn.Parameter(torch.zeros(()))
-        self.max_cls_beta = config.max_cls_beta
-        self.max_box_beta = config.max_box_beta
+        enable_decoder_reference_fusion(
+            self.transformer,
+            DecoderReferenceFusionConfig(
+                max_ref_beta=config.max_box_beta,
+                initial_ref_beta=config.initial_ref_beta,
+                gate_bias=config.gate_bias,
+                start_layer=config.decoder_fusion_start_layer,
+            ),
+        )
         self.prior_channels = config.prior_channels
         self.ref_aux: dict[str, Tensor] = {}
 
     @property
     def beta_cls(self) -> Tensor:
-        """Return capped classification fusion strength."""
-        return self.max_cls_beta * torch.tanh(self.beta_cls_raw)
+        """Return a compatibility scalar for older training logs."""
+        return next(self.parameters()).new_zeros(())
 
     @property
     def beta_box(self) -> Tensor:
-        """Return capped localization fusion strength."""
-        return self.max_box_beta * torch.tanh(self.beta_box_raw)
+        """Return the mean decoder reference beta for training logs."""
+        betas = []
+        for layer in self.transformer.decoder.layers:
+            if hasattr(layer, "ref_beta"):
+                betas.append(layer.ref_beta.reshape(1))
+        if not betas:
+            return next(self.parameters()).new_zeros(())
+        return torch.cat(betas).mean()
 
     def _build_prior_batch(self, samples: Any, targets: Optional[list[dict[str, Tensor]]]) -> Tensor:
         """Pad per-image prior tensors to the RF-DETR batch shape.
@@ -390,53 +290,35 @@ class RefUVLWDETR(nn.Module):
         return prior_batch
 
     @staticmethod
-    def _sample_scalar_map(map_logits: Tensor, boxes: Tensor) -> Tensor:
-        """Sample a scalar map at query centers.
+    def _flatten_reference_features(reference_features: list[Tensor]) -> Tensor:
+        """Flatten multi-scale reference feature maps for deformable attention.
 
         Args:
-            map_logits: Dense scalar logits with shape ``B x 1 x H x W``.
-            boxes: Query boxes in normalized ``cx, cy, w, h`` format.
+            reference_features: Reference feature maps in RF-DETR level order.
 
         Returns:
-            Sampled scalar values with shape ``B x Q x 1``.
+            Flattened memory with shape ``B x sum(H_l W_l) x C``.
         """
-        grid = QueryReferenceSampler._query_grid(boxes)
-        sampled = F.grid_sample(
-            torch.sigmoid(map_logits),
-            grid,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=True,
-        )
-        return sampled.squeeze(-1).transpose(1, 2)
+        return torch.cat([feature.flatten(2).transpose(1, 2) for feature in reference_features], dim=1)
 
-    def _compute_reference_update(
+    def _compute_reference_context(
         self,
         srcs: list[Tensor],
         prior_batch: Tensor,
-        query: Tensor,
-        boxes: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Compute reference update, gate, and lesion logits for final queries.
+    ) -> tuple[Tensor, Tensor]:
+        """Compute decoder reference memory and lesion logits.
 
         Args:
             srcs: UV feature maps.
             prior_batch: Padded RNFR prior tensor.
-            query: Final UV decoder query tokens.
-            boxes: UV-only query boxes.
 
         Returns:
-            Tuple of ``(update, gate, lesion_logits)``.
+            Tuple of ``(reference_memory, lesion_logits)``.
         """
         level_shapes = [(src.shape[-2], src.shape[-1]) for src in srcs]
         prior_features, lesion_logits = self.reference_tokenizer(prior_batch, level_shapes)
         aligned_prior = self.reference_alignment(srcs, prior_features)
-        reference = self.reference_sampler(aligned_prior, boxes)
-        class_confidence = torch.sigmoid(self.class_embed(query)).amax(dim=-1, keepdim=True)
-        lesionness = self._sample_scalar_map(lesion_logits, boxes)
-        gate = self.reference_gate(query, reference, class_confidence, boxes, lesionness)
-        update = self.reference_update(query, reference) * gate
-        return update, gate, lesion_logits
+        return self._flatten_reference_features(aligned_prior), lesion_logits
 
     def forward(self, samples: Any, targets: Optional[list[dict[str, Tensor]]] = None) -> dict[str, Any]:
         """Run Ref-UV DETR forward pass.
@@ -469,13 +351,19 @@ class RefUVLWDETR(nn.Module):
             refpoint_embed_weight = self.refpoint_embed.weight[: self.num_queries]
             query_feat_weight = self.query_feat.weight[: self.num_queries]
 
-        hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
-            srcs,
-            masks,
-            poss,
-            refpoint_embed_weight,
-            query_feat_weight,
-        )
+        prior_batch = self._build_prior_batch(samples, targets)
+        reference_memory, lesion_logits = self._compute_reference_context(srcs, prior_batch)
+        set_decoder_reference_context(self.transformer, reference_memory, lesion_logits)
+        try:
+            hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(
+                srcs,
+                masks,
+                poss,
+                refpoint_embed_weight,
+                query_feat_weight,
+            )
+        finally:
+            clear_decoder_reference_context(self.transformer)
 
         if hs is None:
             raise RuntimeError("RefUVLWDETR requires decoder layers; got hs=None.")
@@ -488,30 +376,12 @@ class RefUVLWDETR(nn.Module):
         else:
             outputs_coord = (self.bbox_embed(hs) + ref_unsigmoid).sigmoid()
 
-        prior_batch = self._build_prior_batch(samples, targets)
-        ref_update, gate, lesion_logits = self._compute_reference_update(srcs, prior_batch, hs[-1], outputs_coord[-1])
-        q_cls = hs[-1] + self.beta_cls * ref_update
-        q_box = hs[-1] + self.beta_box * ref_update
+        outputs_class = self.class_embed(hs)
 
-        outputs_class_base = self.class_embed(hs)
-        outputs_class_final = self.class_embed(q_cls)
-        outputs_class = torch.cat([outputs_class_base[:-1], outputs_class_final.unsqueeze(0)], dim=0)
-
-        if self.bbox_reparam:
-            final_delta = self.bbox_embed(q_box)
-            final_cxcy = final_delta[..., :2] * ref_unsigmoid[-1, ..., 2:] + ref_unsigmoid[-1, ..., :2]
-            final_wh = final_delta[..., 2:].exp() * ref_unsigmoid[-1, ..., 2:]
-            final_boxes = torch.concat([final_cxcy, final_wh], dim=-1)
-        else:
-            final_boxes = (self.bbox_embed(q_box) + ref_unsigmoid[-1]).sigmoid()
-        outputs_coord = torch.cat([outputs_coord[:-1], final_boxes.unsqueeze(0)], dim=0)
-
-        self.ref_aux = {
-            "gate": gate,
-            "lesion_logits": lesion_logits,
-            "beta_cls": self.beta_cls.detach().reshape(1),
-            "beta_box": self.beta_box.detach().reshape(1),
-        }
+        self.ref_aux = collect_decoder_reference_aux(self.transformer)
+        self.ref_aux["lesion_logits"] = lesion_logits
+        self.ref_aux["beta_cls"] = self.beta_cls.detach().reshape(1)
+        self.ref_aux["beta_box"] = self.beta_box.detach().reshape(1)
 
         out: dict[str, Any] = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
         if self.aux_loss:

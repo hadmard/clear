@@ -7,9 +7,11 @@
 """Reference-normalized UV/white prior construction.
 
 The functions in this file are deliberately model-agnostic.  They transform a
-registered UV image and its white-light reference into compact prior maps that
-the detector can use as structural evidence without giving raw white RGB a free
-path into the classifier.
+registered UV image and its white-light reference into compact prior maps for
+the decoder-level reference branch.  The channel set is intentionally small:
+RNFR carries UV-vs-white fluorescence residuals, ExB emphasizes blue response,
+white edges provide structure, and raw white RGB gives the reference encoder
+the leaf texture needed for deformable query sampling.
 """
 
 from __future__ import annotations
@@ -23,14 +25,11 @@ REFERENCE_PRIOR_NAMES: Final[tuple[str, ...]] = (
     "rnfr_r",
     "rnfr_g",
     "rnfr_b",
-    "uv_minus_white_r",
-    "uv_minus_white_g",
-    "uv_minus_white_b",
-    "log_bg_residual",
     "exb_residual",
     "white_edge",
-    "reserved_leaf_confidence",
-    "reserved_distance_to_boundary",
+    "white_raw_r",
+    "white_raw_g",
+    "white_raw_b",
 )
 REFERENCE_PRIOR_CHANNELS: Final[int] = len(REFERENCE_PRIOR_NAMES)
 
@@ -181,33 +180,22 @@ def _white_edge_map(white_rgb: np.ndarray) -> np.ndarray:
     return np.clip(edge / scale, 0.0, 1.0).astype(np.float32)
 
 
-def _distance_to_leaf_boundary(leaf_mask: np.ndarray) -> np.ndarray:
-    """Compute a normalized inside-leaf distance-to-boundary map.
-
-    Args:
-        leaf_mask: Boolean leaf support mask.
-
-    Returns:
-        Float32 ``H x W`` distance map in ``[0, 1]``.
-    """
-    distance = ndimage.distance_transform_edt(leaf_mask).astype(np.float32)
-    max_distance = float(distance.max())
-    if max_distance <= 1e-6:
-        return np.zeros_like(distance, dtype=np.float32)
-    return np.clip(distance / max_distance, 0.0, 1.0).astype(np.float32)
-
-
 def build_reference_prior(
     uv_image: np.ndarray,
     white_image: np.ndarray,
     eps: float = 1e-3,
 ) -> np.ndarray:
-    """Build Reference-Normalized Fluorescence Residual prior channels.
+    """Build compact reference prior channels.
 
     Channel layout is given by :data:`REFERENCE_PRIOR_NAMES`.  The first three
     channels are RNFR:
 
     ``log((UV_c + eps) / (White_c + eps)) - median_leaf(...)``.
+
+    The remaining channels are the existing ExB residual, white Sobel edge, and
+    raw white RGB.  All white-derived channels are softly limited to the leaf
+    support so the decoder reference branch sees structure without learning the
+    calibration grid/background as a shortcut.
 
     Args:
         uv_image: UV RGB image after the same geometric transform as the white
@@ -234,15 +222,6 @@ def build_reference_prior(
     rnfr = _robust_unit_scale(_center_over_leaf(rnfr, leaf_mask), limit=3.0)
     rnfr = rnfr * leaf_confidence[..., None]
 
-    uv_minus_white = (uv - white).astype(np.float32, copy=False)
-    uv_minus_white = uv_minus_white * leaf_confidence[..., None]
-
-    uv_log_bg = np.log((uv[..., 2] + eps) / (uv[..., 1] + eps))
-    white_log_bg = np.log((white[..., 2] + eps) / (white[..., 1] + eps))
-    log_bg = _center_over_leaf((uv_log_bg - white_log_bg)[..., None], leaf_mask)[..., 0]
-    log_bg = _robust_unit_scale(log_bg, limit=3.0)
-    log_bg = log_bg * leaf_confidence
-
     exb_uv = 2.0 * uv[..., 2] - uv[..., 1] - uv[..., 0]
     exb_white = 2.0 * white[..., 2] - white[..., 1] - white[..., 0]
     exb = _center_over_leaf((exb_uv - exb_white)[..., None], leaf_mask)[..., 0]
@@ -250,22 +229,14 @@ def build_reference_prior(
     exb = exb * leaf_confidence
 
     edge = _white_edge_map(white) * leaf_confidence
-
-    # The leaf support is useful as an internal denoising weight, but it is not
-    # reliable enough to feed as a strong model input.  Keep the channel layout
-    # stable and leave these reserved channels silent.
-    reserved_leaf = np.zeros_like(leaf_confidence, dtype=np.float32)
-    reserved_distance = np.zeros_like(leaf_confidence, dtype=np.float32)
+    white_raw = white * leaf_confidence[..., None]
 
     prior_hwc = np.concatenate(
         [
             rnfr,
-            uv_minus_white,
-            log_bg[..., None],
             exb[..., None],
             edge[..., None],
-            reserved_leaf[..., None],
-            reserved_distance[..., None],
+            white_raw,
         ],
         axis=-1,
     )

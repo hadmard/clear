@@ -17,6 +17,12 @@ def sweep_confidence_thresholds(
 ) -> list[dict[str, Any]]:
     """Sweep confidence thresholds and compute precision/recall/F1 at each.
 
+    The global PR-curve values are computed by micro-aggregating TP/FP/FN over
+    all classes at IoU=0.5 matching data prepared by ``build_matching_data()``.
+    This makes the selected threshold correspond to the maximum global F1 point
+    on the PR curve, while per-class arrays remain available for reporting at
+    that same threshold.
+
     Args:
         per_class_data: Per-class matching data list indexed by class id.
             Each entry is a dict with keys ``"scores"``, ``"matches"``, ``"ignore"``, and ``"total_gt"``.
@@ -26,6 +32,9 @@ def sweep_confidence_thresholds(
     Returns:
         List of result dicts, one per threshold, each containing:
             - ``"confidence_threshold"``: float
+            - ``"micro_f1"``: float
+            - ``"micro_precision"``: float
+            - ``"micro_recall"``: float
             - ``"macro_f1"``: float
             - ``"macro_precision"``: float
             - ``"macro_recall"``: float
@@ -40,13 +49,16 @@ def sweep_confidence_thresholds(
         per_class_precisions = []
         per_class_recalls = []
         per_class_f1s = []
+        total_tp = 0
+        total_fp = 0
+        total_gt_count = 0
 
         for k in range(num_classes):
             data = per_class_data[k]
             scores = data["scores"]
             matches = data["matches"]
             ignore = data["ignore"]
-            total_gt = data["total_gt"]
+            class_total_gt = data["total_gt"]
 
             above_thresh = scores >= conf_thresh
             valid = above_thresh & ~ignore
@@ -55,7 +67,10 @@ def sweep_confidence_thresholds(
 
             tp = np.sum(valid_matches != 0)
             fp = np.sum(valid_matches == 0)
-            fn = total_gt - tp
+            fn = class_total_gt - tp
+            total_tp += tp
+            total_fp += fp
+            total_gt_count += class_total_gt
 
             precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
             recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
@@ -74,9 +89,21 @@ def sweep_confidence_thresholds(
             macro_recall = 0.0
             macro_f1 = 0.0
 
+        micro_fn = total_gt_count - total_tp
+        micro_precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        micro_recall = total_tp / (total_tp + micro_fn) if (total_tp + micro_fn) > 0 else 0.0
+        micro_f1 = (
+            2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+            if (micro_precision + micro_recall) > 0
+            else 0.0
+        )
+
         results.append(
             {
                 "confidence_threshold": conf_thresh,
+                "micro_f1": micro_f1,
+                "micro_precision": micro_precision,
+                "micro_recall": micro_recall,
                 "macro_f1": macro_f1,
                 "macro_precision": macro_precision,
                 "macro_recall": macro_recall,

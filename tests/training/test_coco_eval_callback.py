@@ -308,6 +308,7 @@ class TestEpochEndCommon:
         assert f"{prefix}F1" in logged_keys
         assert f"{prefix}precision" in logged_keys
         assert f"{prefix}recall" in logged_keys
+        assert f"{prefix}confidence_threshold" in logged_keys
 
     def test_f1_metrics_zero_when_no_gt(self, stage, hook, prefix) -> None:
         """F1 == 0.0 when no predictions were accumulated (empty epoch)."""
